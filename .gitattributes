@@ -1,0 +1,15 @@
+# 本仓库产物最终运行在 OpenWrt(busybox ash 对 CRLF 会报错)，文本一律 LF
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.bat  text eol=crlf
+Makefile text eol=lf
+luci.openwrt-dsh text eol=lf
+
+# 二进制
+*.node binary
+*.ipk  binary
+*.png  binary

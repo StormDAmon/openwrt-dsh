@@ -1,0 +1,17 @@
+{
+	"openwrt-dsh": {
+		"description": "Grant access to dsh management (openwrt-dsh)",
+		"read": {
+			"ubus": {
+				"luci.openwrt-dsh": [ "status", "log", "listdir", "check_update", "check_dsh" ]
+			},
+			"uci": [ "openwrt-dsh" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.openwrt-dsh": [ "install", "update", "doctor", "uninstall", "selfupdate", "migrate", "localinstall", "web_set", "mkdir" ]
+			},
+			"uci": [ "openwrt-dsh" ]
+		}
+	}
+}

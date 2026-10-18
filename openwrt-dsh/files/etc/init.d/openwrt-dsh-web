@@ -1,0 +1,106 @@
+#!/bin/sh /etc/rc.common
+# openwrt-dsh：dsh Web 服务（procd）——路由器当 dsh Web 主机用（roadmap P1）
+#
+# 首行必须是 rc.common：OpenWrt init 脚本靠它分发 start/stop/restart/enable/
+# enabled 等子命令——写成普通 #!/bin/sh 的话，`/etc/init.d/x start` 会把整个文件
+# 当普通脚本跑一遍、什么都不做（静默无效，比报错更难查）。
+#
+# 与本包其他部分的关系：
+#   - UCI openwrt-dsh.web.{enabled,port} 是唯一开关与配置（LuCI「Web 界面」区读写，
+#     rpcd web_set 托管 enable/disable + start/stop）；
+#   - 进程包装 web-run.sh 把带令牌访问链接落到 /tmp/openwrt-dsh-web/out.log，
+#     rpcd status 从中取 URL；本脚本只负责进程生命周期与门槛。
+#
+# 门槛（双闸，start_service 里逐条过）：
+#   1. UCI enabled=1——没开就绝不拉起（默认关；这个服务把 dsh 界面暴露给局域网，
+#      必须用户显式开启）；
+#   2. dsh 已安装（与 /usr/bin/dsh wrapper 同一套运行时解析）——没装就起，进程会
+#      进 respawn 死循环刷日志。
+# 两个门槛任一不过，服务保持「已停止」，不算错误。
+#
+# 防火墙口径（roadmap「先明确防火墙口」）：本服务不加任何防火墙规则。OpenWrt
+# 默认 WAN 侧入站全拒，LAN 侧全放——LAN only 靠默认防火墙 + 绑定即得；用户做了
+# 端口转发/DMZ 那是自己扩的暴露面，LuCI 区块文案里有明确警示。
+
+USE_PROCD=1
+
+START=99
+STOP=10
+
+RUNNER=/usr/lib/openwrt-dsh/web-run.sh
+STATE_DIR=/tmp/openwrt-dsh-web
+
+web_enabled() {
+	[ "$(uci -q get openwrt-dsh.web.enabled 2>/dev/null)" = "1" ]
+}
+
+web_port() {
+	local p
+	p="$(uci -q get openwrt-dsh.web.port 2>/dev/null)"
+	case "$p" in
+		''|*[!0-9]*) p="" ;;
+	esac
+	if [ "$p" -lt 1 ] 2>/dev/null || [ "$p" -gt 65535 ] 2>/dev/null; then
+		p=""
+	fi
+	# 旧版固定默认 3080 并入自动（§25：老 conffile 升级被 opkg 原样保留
+	# port='3080'，正是真机撞车现场，不迁移它自动选端口就永远轮不到）
+	[ "$p" = "3080" ] && p=""
+	# 留空 = auto：由 web-run.sh 每次启动在 3081-3099 里现选空闲口。为什么不在
+	# 此处选好写回 UCI：start_service 里写 UCI 会再触发 openwrt-dsh 的 config
+	# trigger 重启本服务，往复空转（§25）
+	[ -n "$p" ] && { printf '%s' "$p"; return 0; }
+	printf 'auto'
+}
+
+# 与 /usr/bin/dsh wrapper 相同的「已安装」判定：安装目录下任一托管运行时里
+# node 与 dsh 同时在。不跑 dsh --version（那是秒级拉 node，init 里不值得）
+dsh_installed() {
+	local d b
+	d="$(uci -q get openwrt-dsh.core.install_dir 2>/dev/null)"
+	[ -n "$d" ] || d="/opt/openwrt-dsh"
+	for b in "$d"/runtime/node-v*/bin; do
+		[ -x "$b/node" ] && [ -e "$b/dsh" ] && return 0
+	done
+	return 1
+}
+
+start_service() {
+	if ! web_enabled; then
+		logger -t openwrt-dsh-web "未启用（openwrt-dsh.web.enabled≠1），不启动；LuCI「Web 界面」区可开启"
+		return 0
+	fi
+	if ! dsh_installed; then
+		logger -t openwrt-dsh-web "dsh 尚未安装，Web 服务无法启动；先安装 dsh 再开启"
+		return 1
+	fi
+	procd_open_instance web
+	procd_set_param command /bin/sh "$RUNNER"
+	# HOME 显式给（procd 实例环境无登录壳，dsh 解析 DSH_HOME 依赖它）；端口经环境
+	# 传给包装（auto = web-run.sh 每次启动现选空闲口），改 UCI 后 reload/restart
+	# 即生效
+	procd_set_param env HOME="/root" ODSH_WEB_PORT="$(web_port)"
+	# 端口被占/配置坏等崩溃场景：5 秒阈值内重试最多 5 次，仍败则放弃（状态表可见
+	# 「已停止」，不无限刷日志）。自动选端口输了「探测→绑定」竞窗也靠它重挑（§25）
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+}
+
+stop_service() {
+	# tmpfs 状态目录随服务清掉：out.log 里的带令牌链接只对「当前进程」有效，
+	# 服务停了 rpcd 就不该再报旧地址（token 已随进程失效，报出来只会误导）
+	rm -rf "$STATE_DIR"
+}
+
+reload_service() {
+	# 本服务没有可热更的配置（端口在启动参数里），reload 即重启
+	restart
+}
+
+service_triggers() {
+	# openwrt-dsh 配置一变（LuCI 保存设置 / web_set 写 enabled）就重启本服务：
+	# 端口改动即时生效；用户在 LuCI 手改了 UCI（不经 web_set）也能被接住。
+	# 触发走 procd 的 config trigger 机制，容器/无 procd 环境没有它也不影响
+	# 显式的 start/stop 路径
+	procd_add_config_trigger "config.change" "openwrt-dsh" /etc/init.d/openwrt-dsh-web reload
+}

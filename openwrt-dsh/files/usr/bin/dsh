@@ -1,0 +1,22 @@
+#!/bin/sh
+# openwrt-dsh 托管入口（由 ipk 装到 /usr/bin/dsh）：解析 UCI 安装目录下最新的托管
+# 运行时，补 PATH 后 exec dsh。做成 wrapper 而不是软链：npm 产出的 bin/dsh 指向
+# lib/bin.js，其首行是 #!/usr/bin/env node——软链在没带运行时 PATH 的调用方
+# （cron / procd / ubus / 非登录 SSH）里必死；wrapper 自带 PATH 补全，谁都可用。
+# 动态挑最新 node-v*（与 /etc/profile.d/openwrt-dsh.sh 同一套解析逻辑），不写死
+# 版本目录；只有 node 与 dsh 都在的运行时才入选。
+D="$(uci -q get openwrt-dsh.core.install_dir 2>/dev/null)"
+[ -n "$D" ] || D="/opt/openwrt-dsh"
+B=""
+for d in "${D%/}"/runtime/node-v*/bin; do
+	[ -x "$d/node" ] && [ -e "$d/dsh" ] && B="$d"
+done
+if [ -z "$B" ]; then
+	echo "dsh 尚未安装：先执行 openwrt-dsh install，或在 LuCI「服务 → DeepSeek Harness」一键安装" >&2
+	exit 1
+fi
+case ":$PATH:" in
+	*":$B:"*) : ;;
+	*) PATH="$B:$PATH"; export PATH ;;
+esac
+exec "$B/dsh" "$@"

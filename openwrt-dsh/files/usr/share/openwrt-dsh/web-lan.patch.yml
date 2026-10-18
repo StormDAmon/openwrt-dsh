@@ -1,0 +1,26 @@
+# openwrt-dsh：dsh Web 服务的 LAN 绑定 overlay（--patch 官方通道）
+#
+# 为什么需要它：dsh web 的监听地址在 WebServer 配置行里，CLI 的 --host 只认
+# 127.0.0.1 / 0.0.0.0 两个值，且命令行显式拒绝 0.0.0.0（上游「暂不为安全开放」
+# 的保守闸门）。但配置层本来就允许 0.0.0.0：schema 是两值 union，绑定后 dsh 会
+# 自动把所有非回环 IPv4 字面量加进浏览器信任栅栏、并在启动行打印
+# 「(LAN: http://<ip>:<port>/?token=…)」——LAN 直连是一等部署形态，只是没开 CLI
+# 旗子。所以本包走 --patch overlay（官方参数，优先级高于 bundle 层）钉 host，
+# 端口仍走 --port 命令行（由 init 脚本从 UCI openwrt-dsh.web.port 传入）。
+#
+# ⚠ 补丁会整体替换目标行的 config（dsh 补丁机制语义），所以这里必须把 webserver
+# 行的全部键按 dsh-web-app 自带 cordis.patch.yml 的现值原样重述——只写 host 一个键
+# 会把 port/compression 全部抹掉。dsh 未来若增改这些键的默认值，这里要跟着同步
+# （症状：端口/压缩行为回退出厂值）。dsh 实测基线：0.2.0-rc.2（2026-10-19）。
+#
+# 安全边界：开了本 overlay = 监听所有网卡。首次访问仍必须凭一次性令牌链接
+# （launch token 只在进程内存与启动行 stdout，无令牌一律 401），拿不令牌就是拿
+# 不到界面。默认 enabled=0，用户在 LuCI 显式开启；不要把该端口转发到外网。
+
+- id: webserver
+  config:
+    host: '0.0.0.0'
+    port: !!js ctx.webStartup.port ?? 3080
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024

@@ -1,0 +1,15 @@
+# 构建产物
+*.ipk
+*.tar.gz
+work/
+sdk/
+dist/
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+*.swp
+
+# 本机会话与测试散落物(不入库):DSH 会话动作配置、UI 回归散落到根目录的截图
+.dsh/
+/*.png

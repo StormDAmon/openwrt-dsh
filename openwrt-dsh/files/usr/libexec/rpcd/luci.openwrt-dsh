@@ -1,0 +1,437 @@
+#!/bin/sh
+# rpcd 后端（LuCI ↔ 引擎的桥）：ubus object = luci.openwrt-dsh
+# 方法：status（状态+日志尾）/ log（大段日志）/ install / update / doctor / uninstall / selfupdate（后台起任务）
+#       migrate（迁移安装目录，后台起任务）/ localinstall（上传包本地安装，后台起任务）
+#       check_update（同步查 GitHub 最新发布，秒级）
+#       check_dsh（同步查 npm 源上 dsh 运行时最新版，秒级；LuCI「更新 dsh」的前置检查）
+#       web_set（启/停 dsh Web 服务：写 UCI + 托管 init 脚本 enable/disable+start/stop）
+#       （web_remote_set 已删，2026-10-21：LAN 设置解锁补丁默认涂抹、无开关，
+#       porting-notes §26 补记；补丁实况仍在 status 的 web_remote_state 透出）
+#       listdir（列目录，供 LuCI 图形化选安装目录/迁移目标）/ mkdir（新建文件夹）
+# stdout 必须是合法 JSON：日志先清控制字符（ESC/进度 \r），再转义。
+
+MODDIR="/usr/lib/openwrt-dsh"
+. "$MODDIR/lib.sh"
+
+# stdin → 合法 JSON 字符串体：\r 换行（下载进度行展开成多行，可读）、删其余控制字符
+# （下载器输出的 ESC 清色序列对 JSON 是非法控制字符）、转义 反斜杠/引号/tab，行间拼 \n
+json_escape() {
+    tr '\r' '\n' | tr -d '\000-\010\013\014\016-\037' | \
+    awk 'BEGIN { ORS = "" } { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); print $0 "\\n" }'
+}
+
+# rpcd exec 插件入口归一化（2026-10-17 双容器实锤,见 porting-notes §15）：
+#   现行约定(22.03.7 rpcd 2022-12-15 与 24.10.8 rpcd 2025.09.01 均实测):
+#     <脚本> call <方法名>   —— JSON 参数走 stdin,stdout 第一个完整 JSON 对象即应答
+#   旧资料/假想约定: <脚本> <方法名>
+# 之前只写旧形态,导致桥层在所有目标平台「注册成功、调用必空」——LuCI 永远误报后端不可用。
+METHOD="$1"
+if [ "$1" = "call" ] && [ -n "$2" ]; then
+    METHOD="$2"
+fi
+
+case "$METHOD" in
+    list)
+        echo '{ "status": {}, "log": {}, "install": { "version": "" }, "update": { "version": "" }, "doctor": {}, "uninstall": { "runtime": "" }, "selfupdate": {}, "migrate": { "target": "" }, "localinstall": { "path": "" }, "check_update": {}, "check_dsh": {}, "web_set": { "on": "" }, "listdir": { "path": "" }, "mkdir": { "dir": "", "name": "" } }'
+    ;;
+    status)
+        st="$(sh "$MODDIR/status.sh" 2>/dev/null)"
+        get() { printf '%s\n' "$st" | sed -n "s/^$1=//p" | head -n 1; }
+        log_json="$(odw_log_tail 8192 | json_escape)"
+        # —— dsh Web 服务状态（全本地读，不联网不拉 node，快路径纪律同上）——
+        web_enabled="$(uci -q get openwrt-dsh.web.enabled 2>/dev/null)"
+        [ "$web_enabled" = "1" ] || web_enabled="0"
+        web_port="$(uci -q get openwrt-dsh.web.port 2>/dev/null)"
+        case "$web_port" in ''|*[!0-9]*) web_port="" ;; esac
+        if [ "$web_port" -lt 1 ] 2>/dev/null || [ "$web_port" -gt 65535 ] 2>/dev/null; then
+            web_port=""
+        fi
+        # 旧版固定 3080 并入自动（§25）：status 只报「配置语义」（空=自动），实际
+        # 生效端口以 out.log 启动行为唯一真源、由前端从 web_url 解析——这里若还
+        # fabrication 3080，自动模式下「打开」链接就会指去一个没人监听的端口
+        [ "$web_port" = "3080" ] && web_port=""
+        # 运行与否以 procd 服务注册表为准（ubus service list，毫秒级）；
+        # jsonfilter 路径里的包名段带连字符，必须用引号形态取键
+        web_running=""
+        if ubus call service list 2>/dev/null | jsonfilter -e '@["openwrt-dsh-web"].instances.web' >/dev/null 2>&1; then
+            web_running="1"
+        fi
+        # 带令牌访问链接：web-run.sh 把 dsh web 的启动行落到 /tmp/openwrt-dsh-web/out.log，
+        # 绑 0.0.0.0 时启动行形如「dsh web: http://127.0.0.1:3080/?token=X (LAN: http://<lanip>:3080/?token=X)」，
+        # 取 LAN 链接（浏览器可直达；回环链接只有路由器本机能用）。服务没在运行就不读——
+        # 旧链接的 token 已随旧进程失效
+        web_url=""
+        if [ "$web_running" = "1" ] && [ -f /tmp/openwrt-dsh-web/out.log ]; then
+            web_url="$(sed -n 's/.*(LAN: \([^)]*\)).*/\1/p' /tmp/openwrt-dsh-web/out.log 2>/dev/null | tail -n 1)"
+            [ -n "$web_url" ] || web_url="$(sed -n 's/^dsh web: \([^ ]*\).*/\1/p' /tmp/openwrt-dsh-web/out.log 2>/dev/null | tail -n 1)"
+            # 只放行 http 链接并剔除引号反斜杠——它要原样进 JSON 字符串
+            case "$web_url" in
+                http://*) web_url="$(printf '%s' "$web_url" | tr -d '"\\')" ;;
+                *) web_url="" ;;
+            esac
+        fi
+        # 启动失败原因透出（2026-10-20 真机实锤，porting-notes §24）：端口被占等场景
+        # dsh 秒崩、procd respawn 5 次后放弃。两个坑叠一起：崩溃输出只进没人看的
+        # out.log/logread；更狠的是 procd 放弃后 instance 永久留在 service list
+        # （running:false，实测 /bin/false 崩溃服务 80s 不注销）——运行判据若只看
+        # 注册表，崩溃循环期 web_running 恒为 1，UI 会永远「运行中（正在生成访问
+        # 链接…）」。所以健康判据改看 web-run.sh 的 out.log（每次拉起清零，天然
+        # 新鲜）：有本进程启动行（dsh web:）= 健康；非空且无启动行 = 起来就崩。
+        # 只在 enabled=1 时读：停用时目录已被 stop_service 清掉
+        #
+        # 原因提取必须按特异性分层（2026-10-20 真机再实锤，porting-notes §25）：
+        # dsh 崩溃输出首行永远是概括行「… startup failed: N required plugins did
+        # not activate」，真凶（EADDRINUSE 那行）排在它后面——按「首个含
+        # error/failed 的行」抓永远命中概括行，真因被吞，用户只看到天书。所以
+        # 端口被占/无权限给中文人话（含自救指引），都 miss 才退回原始错误行；
+        # 提取端口用「行内最后一个 :数字」（EADDRINUSE 行以 0.0.0.0:端口 收尾）。
+        # 所有文案统一走 json_escape（友好文案虽不含引号/反斜杠，防御性一致）——
+        # 原始行的截断仍在转义之前（先 head -c 原始字节，反过来会拦腰切断 \n
+        # 转义序列造出非法 JSON，§24）
+        web_error=""
+        if [ "$web_enabled" = "1" ] && [ -s /tmp/openwrt-dsh-web/out.log ] && \
+           ! grep -q 'dsh web:' /tmp/openwrt-dsh-web/out.log 2>/dev/null; then
+            weberr="$(grep -i -m1 -E 'eaddrinuse|address already in use' /tmp/openwrt-dsh-web/out.log 2>/dev/null)"
+            if [ -n "$weberr" ]; then
+                webport_busy="$(printf '%s\n' "$weberr" | sed -n 's/.*:\([0-9][0-9]*\).*/\1/p')"
+                case "$webport_busy" in ''|*[!0-9]*) webport_busy="" ;; esac
+                if [ -n "$webport_busy" ]; then
+                    web_error="启动失败：端口 ${webport_busy} 已被其他程序占用（EADDRINUSE）。停掉占用该端口的程序后重新启用；若在 UCI 里手工配过固定端口（openwrt-dsh.web.port），删除该选项即回到自动选端口"
+                else
+                    web_error="启动失败：监听端口已被其他程序占用（EADDRINUSE）。停掉占用该端口的程序后重新启用；若在 UCI 里手工配过固定端口（openwrt-dsh.web.port），删除该选项即回到自动选端口"
+                fi
+            else
+                weberr="$(grep -i -m1 -E 'eacces|permission denied' /tmp/openwrt-dsh-web/out.log 2>/dev/null)"
+                if [ -n "$weberr" ]; then
+                    web_error="启动失败：没有权限绑定监听端口（EACCES）。服务缺省自动在 3081-3099 选空闲端口；若在 UCI 里手工配过 1024 以下的固定端口（openwrt-dsh.web.port），删除该选项即回到自动"
+                else
+                    web_error="$( { grep -i -m1 -E 'error|failed|失败|无法|cannot' /tmp/openwrt-dsh-web/out.log || tail -n 2 /tmp/openwrt-dsh-web/out.log; } 2>/dev/null | sed -e 's/token=[^&" ]*/token=***/g' | head -c 500 )"
+                fi
+            fi
+            web_error="$(printf '%s' "$web_error" | json_escape)"
+        fi
+        # LAN 设置解锁（§26）：UCI 开关 + 补丁实况。补丁实况只在开关开启时查——
+        # 关着时 UI 只需要「未开启」，不值得每 2s 扫文件；查询范围只限最新运行时的
+        # 既定落点（web-patch.sh state：纯 [ -f ] + grep -F），毫秒级快路径纪律同上。
+        # 2026-10-21 起补丁默认涂抹、无开关（§26 补记）：state 无条件计算（dsh 未装时
+        # state=absent，同样是 [ -f ] 毫秒级），web_remote 开关字段随之删除
+        web_remote_state="$(sh "$MODDIR/web-patch.sh" state "$(get node_dir)" 2>/dev/null | sed -n 's/^state=//p' | head -n 1)"
+        printf '{"arch":"%s","libc":"%s","distro":"%s","supported":"%s","install_dir":"%s","free":"%s","registry":"%s","min_node":"%s","node_version":"%s","node_dir":"%s","dsh_version":"%s","task_phase":"%s","task_rc":"%s","task_name":"%s","task_ts":"%s","pkg_version":"%s","gh_check_status":"%s","gh_latest":"%s","gh_available":"%s","gh_check_ts":"%s","dsh_check_status":"%s","dsh_latest":"%s","dsh_available":"%s","dsh_check_ts":"%s","web_enabled":"%s","web_port":"%s","web_running":"%s","web_url":"%s","web_error":"%s","web_remote_state":"%s","log":"%s"}\n' \
+            "$(get arch)" "$(get libc)" "$(get distro)" "$(get supported)" \
+            "$(get install_dir)" "$(get free)" "$(get registry)" "$(get min_node)" \
+            "$(get node_version)" "$(get node_dir)" "$(get dsh_version)" \
+            "$(get task_phase)" "$(get task_rc)" "$(get task_name)" "$(get task_ts)" \
+            "$(get pkg_version)" "$(get gh_check_status)" "$(get gh_latest)" \
+            "$(get gh_available)" "$(get gh_check_ts)" \
+            "$(get dsh_check_status)" "$(get dsh_latest)" \
+            "$(get dsh_available)" "$(get dsh_check_ts)" \
+            "$web_enabled" "$web_port" "$web_running" "$web_url" "$web_error" \
+            "$web_remote_state" \
+            "$log_json"
+    ;;
+    log)
+        printf '{"log":"%s"}\n' "$(odw_log_tail 65536 | json_escape)"
+    ;;
+    check_update)
+        # 检查 GitHub 最新发布（LuCI「检查更新」按钮）。同步执行：后端单跳限 12s、
+        # 代理+直连两跳共 24s，赶在 LuCI rpc 超时（30s）内；结果同时写缓存，
+        # 之后的 status 轮询把结果显示出来（UI 上按钮点击的应答与本结果同源）
+        out="$(odw_update_check 2>/dev/null)"
+        get() { printf '%s\n' "$out" | sed -n "s/^$1=//p" | head -n 1; }
+        printf '{"status":"%s","installed":"%s","latest":"%s","available":"%s","error":"%s","ts":"%s"}\n' \
+            "$(get status)" "$(get installed)" "$(get latest)" \
+            "$(get available)" "$(get error)" "$(get ts)"
+    ;;
+    check_dsh)
+        # 检查 npm 源上 dsh 运行时最新版（LuCI「更新 dsh」的前置检查——确认真有新版
+        # 才弹「更新到 X」确认框，已是最新/查不到都不给按钮）。同步执行：npm 源单跳
+        # 限 12s，赶在 LuCI rpc 超时（30s）内；结果同时写缓存，之后的 status 轮询
+        # 把「可更新到 X」显示在状态表「dsh 版本」行。本机当前版本读安装期落盘的
+        # 版本标记（毫秒级，不拉 node——快路径纪律同 status）
+        cur="$(sed -n '1p' "$(odw_install_dir)/dsh.version" 2>/dev/null | tr -d '\r')"
+        out="$(odw_dsh_check "$cur" 2>/dev/null)"
+        get() { printf '%s\n' "$out" | sed -n "s/^$1=//p" | head -n 1; }
+        printf '{"status":"%s","installed":"%s","latest":"%s","available":"%s","error":"%s","ts":"%s"}\n' \
+            "$(get status)" "$(get installed)" "$(get latest)" \
+            "$(get available)" "$(get error)" "$(get ts)"
+    ;;
+    web_set)
+        # 启用/停用 dsh Web 服务（LuCI「Web 界面」区的开关按钮）。同步执行：全是
+        # 本地毫秒级操作（uci + init 脚本）；procd 拉起是异步的，真正的运行状态
+        # 以 status 轮询的 web_running 为准，前端 2s 内自动看到结果。
+        #
+        # 2026-10-20 真机实锤（家里路由器，porting-notes §24）：/etc/config/openwrt-dsh
+        # 是 conffile，老包升级 opkg 一律保留旧配置——web 段可能根本不存在；而 uci 的
+        # 三段式 set（cfg.web.enabled=1）对不存在的具名段直接报 Invalid argument，
+        # 不会自动建段。此前这里 stderr 随 rpcd 蒸发、还照常回 ok，用户点「启用」
+        # 全程零效果零报错。所以：先自愈建段，任何一步失败必须如实回 error。
+        # 应答六态（§25 增 port_busy）：ok / not_installed / no_init / port_busy
+        # （附带 port+detail 占用线索）/ error / invalid
+        read -r input
+        on="$(jsonfilter -s "$input" -e '@.on' 2>/dev/null)"
+        if [ "$on" != "1" ] && [ "$on" != "0" ]; then
+            echo '{"status":"invalid"}'
+            exit 0
+        fi
+        if [ "$on" = "1" ]; then
+            # 「已装性」判断与 init 脚本同源（任一托管运行时里 node 与 dsh 都在）：
+            # 没装就拒绝，省得服务进了 respawn 循环用户还以为开成功了
+            inst="$(uci -q get openwrt-dsh.core.install_dir 2>/dev/null)"
+            [ -n "$inst" ] || inst="/opt/openwrt-dsh"
+            ok=""
+            for b in "$inst"/runtime/node-v*/bin; do
+                [ -x "$b/node" ] && [ -e "$b/dsh" ] && { ok="1"; break; }
+            done
+            if [ -z "$ok" ]; then
+                echo '{"status":"not_installed"}'
+                exit 0
+            fi
+            # init 脚本缺失 = 包安装不完整（升级半途/手工清理过），提前明确拒绝，
+            # 不给「受理成功」的假象——procd 层面无壳可拉，start 静默无效
+            if [ ! -x /etc/init.d/openwrt-dsh-web ]; then
+                echo '{"status":"no_init"}'
+                exit 0
+            fi
+            # 端口预检（2026-10-20 真机再实锤，porting-notes §25）：端口被占时 dsh
+            # 秒崩、procd respawn 5 次才放弃，用户视角只有「已启用，但未运行」+ 一句
+            # 天书。受理前先看一眼 netstat，被占就拒绝并附占用行当线索，不让用户进
+            # 盲区。跳过条件是 procd 实例 running=true（正在跑的改端口重启场景）而
+            # 非「实例存在」——崩溃放弃后实例仍驻留注册表（§24），按存在性跳过会让
+            # 重试永远绕过预检。netstat -p 拿不到占用者就退回不带 -p（照拦不误）
+            wr="$(ubus call service list 2>/dev/null | jsonfilter -e '@["openwrt-dsh-web"].instances.web.running' 2>/dev/null)"
+            if [ "$wr" != "true" ]; then
+                webp="$(uci -q get openwrt-dsh.web.port 2>/dev/null)"
+                case "$webp" in ''|*[!0-9]*) webp="auto" ;; esac
+                if [ "$webp" -lt 1 ] 2>/dev/null || [ "$webp" -gt 65535 ] 2>/dev/null; then
+                    webp="auto"
+                fi
+                # 旧版固定 3080 并入自动（§25）
+                [ "$webp" = "3080" ] && webp="auto"
+                if [ "$webp" = "auto" ]; then
+                    # 自动模式预检的是「段里至少有一个空闲」；真正选口在 web-run.sh
+                    # 启动时现做——探测到绑定之间的竞窗由 procd respawn 重挑兜底
+                    # （§25）。段全满（19 连号全占）才拒启，附带人话出路
+                    free=""
+                    p=3081
+                    while [ "$p" -le 3099 ]; do
+                        if ! netstat -tln 2>/dev/null | grep -q "[.:]${p}[[:space:]]"; then
+                            free=1
+                            break
+                        fi
+                        p=$((p + 1))
+                    done
+                    if [ -z "$free" ]; then
+                        printf '{"status":"port_busy","port":"auto","detail":"%s"}\n' \
+                            "$(printf '%s' "自动端口段 3081-3099 全被占用，无法自动选择；请停掉占用这些端口的程序，或在 UCI 手工指定固定端口（openwrt-dsh.web.port）" | json_escape)"
+                        exit 0
+                    fi
+                else
+                    held="$( { netstat -tlnp 2>/dev/null || netstat -tln 2>/dev/null; } | grep -m1 -E "[.:]${webp}[[:space:]]")"
+                    if [ -n "$held" ]; then
+                        printf '{"status":"port_busy","port":"%s","detail":"%s"}\n' \
+                            "$webp" "$(printf '%s' "端口 ${webp} 已被占用，无法监听：${held}" | json_escape)"
+                        exit 0
+                    fi
+                fi
+            fi
+            # conffile 丢段自愈：具名段只能用两段式 set cfg.web=web 创建（uci get
+            # 对存在的具名段返回其类型名，正好当存在性探测）；建不出来就如实报错
+            uci -q get openwrt-dsh.web >/dev/null 2>&1 || uci set openwrt-dsh.web='web' 2>/dev/null
+            if ! uci set openwrt-dsh.web.enabled='1' 2>/dev/null; then
+                echo '{"status":"error"}'
+                exit 0
+            fi
+            uci commit openwrt-dsh
+            # enable 落 rc.d 自启链接（重启后仍生效）；start 经 procd 异步拉起
+            /etc/init.d/openwrt-dsh-web enable 2>/dev/null
+            /etc/init.d/openwrt-dsh-web start 2>/dev/null
+        else
+            # 停用路径尽量幂等：段缺失/已停时 set 失败不算错（stop/disable 本就
+            # 可重入），把服务停干净、自启摘掉就是成功
+            uci -q get openwrt-dsh.web >/dev/null 2>&1 || uci set openwrt-dsh.web='web' 2>/dev/null
+            uci set openwrt-dsh.web.enabled='0' 2>/dev/null
+            uci commit openwrt-dsh
+            # 先停后摘自启：停服务顺带清掉 /tmp 里的旧令牌链接（stop_service）
+            /etc/init.d/openwrt-dsh-web stop 2>/dev/null
+            /etc/init.d/openwrt-dsh-web disable 2>/dev/null
+        fi
+        echo '{"status":"ok"}'
+    ;;
+    install|update|doctor|uninstall|selfupdate|migrate|localinstall)
+        # stdin 是 rpcd 传来的 JSON 参数;install/update 收 {"version":"…"}(留空 = 最新版),
+        # uninstall 收 {"runtime":"1"}(连托管 Node 运行时一起删,purge 档;缺省保留运行时),
+        # migrate 收 {"target":"/abs/path"}(迁移目标目录),localinstall 收 {"path":"…"}(上传包
+        # 落点),selfupdate 无参数。版本串白名单校验:它会拼进 npm install 规格与远端 URL,
+        # 只放行安全字符
+        read -r input
+        ver=""
+        mode="keep"
+        tgt=""
+        if [ -n "${input:-}" ]; then
+            if [ "$METHOD" = "uninstall" ]; then
+                if [ "$(jsonfilter -s "$input" -e '@.runtime' 2>/dev/null)" = "1" ]; then
+                    mode="purge"
+                fi
+            elif [ "$METHOD" = "migrate" ]; then
+                tgt="$(jsonfilter -s "$input" -e '@.target' 2>/dev/null)"
+            elif [ "$METHOD" = "localinstall" ]; then
+                tgt="$(jsonfilter -s "$input" -e '@.path' 2>/dev/null)"
+            else
+                ver="$(jsonfilter -s "$input" -e '@.version' 2>/dev/null)"
+            fi
+        fi
+        case "$ver" in
+            ''|*[!A-Za-z0-9.@/_-]*) ver="" ;;
+        esac
+        if [ "$METHOD" = "migrate" ]; then
+            # 迁移目标：绝对路径 + 禁 . .. 段（深层校验/嵌套/冲突/空间护栏在 migrate-dsh.sh）
+            case "$tgt" in
+                /*) : ;;
+                *) echo '{"status":"invalid_target"}'; exit 0 ;;
+            esac
+            tgt="${tgt%/}"
+            [ -n "$tgt" ] || tgt="/"
+            case "$tgt" in
+                "/.."|*/../*|*/..|"/."|*/./*) echo '{"status":"invalid_target"}'; exit 0 ;;
+            esac
+        fi
+        if [ "$METHOD" = "localinstall" ]; then
+            # 上传包只认 LuCI 上传通道的固定落点：cgi-io 的落盘路径受会话 ACL 按路径管控
+            # （luci-base 只放行 /etc/luci-uploads/*，上传到别处本就到不了），前端固定传这个
+            # 名字；task.sh 与 localinstall.sh 还各有一道同款白名单，三处一致防误装任意文件。
+            # 先秒级查一眼文件在不在，省得用户干等一轮任务才发现包丢了
+            if [ "$tgt" != "/etc/luci-uploads/openwrt-dsh-upload.ipk" ]; then
+                echo '{"status":"invalid_path"}'; exit 0
+            fi
+            [ -s "$tgt" ] || { echo '{"status":"missing_file"}'; exit 0; }
+        fi
+        if [ "$(odw_state_get phase)" = "running" ] && [ -d "$ODW_LOCK_DIR" ]; then
+            echo '{"status":"busy"}'
+        else
+            # 后台拉起：stdout/stderr/stdin 全部脱离 rpcd 的应答管道，否则 rpcd 会等子进程退出才回包
+            # uninstall 的第 2 参是档位(keep|purge)不是版本；migrate 的第 2 参是目标目录；
+            # localinstall 的第 2 参是上传包落点；selfupdate 无第 2 参
+            arg2="$ver"
+            if [ "$METHOD" = "uninstall" ]; then arg2="$mode"; fi
+            if [ "$METHOD" = "migrate" ]; then arg2="$tgt"; fi
+            if [ "$METHOD" = "localinstall" ]; then arg2="$tgt"; fi
+            sh "$MODDIR/task.sh" "$METHOD" "$arg2" </dev/null >/dev/null 2>&1 &
+            echo '{"status":"started"}'
+        fi
+    ;;
+    listdir)
+        # LuCI 图形化选安装目录的数据源：列出 path 下的子目录（只列目录，不列文件）。
+        # 每条目带挂载标注（mount=是否挂载点、tmpfs=内存盘）与挂载点的可用空间——
+        # 选目录的核心诉求是「找个放得下 300MB 运行时的分区」，所以把空间直接标出来。
+        # 路径仅用于带引号的 shell 展开（f="$p"/* 等），无注入面；仍归一化校验兜底。
+        read -r input
+        p="$(jsonfilter -s "$input" -e '@.path' 2>/dev/null)"
+        case "$p" in
+            /*) ;;
+            *) p="/" ;;
+        esac
+        p="${p%/}"
+        [ -n "$p" ] || p="/"
+        if [ ! -d "$p" ]; then
+            echo '{"error":"notdir"}'
+            exit 0
+        fi
+        # /proc/mounts 一次读全：M=真实分区 T=tmpfs/ramfs 内存盘（装上去重启即失，UI 要警示）。
+        # 内核 ABI 把路径里的空格转义成 \040（列位才不会因带空格的挂载点错位），比对前还原
+        mlist="$(awk '{
+            gsub(/\\040/, " ", $2)
+            if ($3 == "tmpfs" || $3 == "ramfs") print "T\t" $2
+            else print "M\t" $2
+        }' /proc/mounts 2>/dev/null)"
+        free="$(odw_free_bytes "$p")"
+        # 当前目录自身的挂载标注：必须在管道外算好——for…done|awk 的循环段跑在子壳里，
+        # 循环里赋的变量带不回来（busybox ash 无 lastpipe）
+        cm=""
+        ct=""
+        if [ -n "$mlist" ]; then
+            while IFS="$(printf '\t')" read -r mk mp; do
+                [ "$p" = "$mp" ] || continue
+                cm=1
+                [ "$mk" = "T" ] && ct=1
+            done <<EOF
+$mlist
+EOF
+        fi
+        n=0
+        # glob 不匹配时原样保留字面量，靠 [ -d ] 过滤（幂等：探测后才采用）；glob 结果天然有序
+        for f in "$p"/* "$p"/.[!.]* ; do
+            [ -d "$f" ] || continue
+            [ "$n" -lt 400 ] || continue
+            # p="/" 时 glob 出的是 //bin 形态：去一个前导斜杠归一成 /bin——
+            # 否则前端带着双斜杠逐层下钻，且挂载点比对（/proc/mounts 是单斜杠）永远落空
+            case "$p" in
+                "/") f="${f#/}" ;;
+            esac
+            m=""
+            t=""
+            # 逐条目比对挂载表
+            while IFS="$(printf '\t')" read -r mk mp; do
+                [ -n "$mk" ] || continue
+                if [ "$f" = "$mp" ]; then
+                    m=1
+                    [ "$mk" = "T" ] && t=1
+                fi
+            done <<EOF
+$mlist
+EOF
+            # 可用空间只对挂载点算（df 一次一调用；非挂载点子目录与父分区同盘，无需重复）
+            fr=""
+            if [ -n "$m" ]; then
+                fr="$(odw_free_bytes "$f")"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' "$m" "$t" "$fr" "$f" "${f##*/}"
+            n=$((n + 1))
+        done | P="$p" FREE="$free" CM="$cm" CT="$ct" awk '
+            function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+            BEGIN {
+                FS = "\t"; ORS = ""
+                # 经 ENVIRON 传值而非 -v：awk 的 -v 会二次解释 \n 等转义，路径名含反斜杠会被改坏
+                p = ENVIRON["P"]; free = ENVIRON["FREE"]
+                print "{\"path\":\"" esc(p) "\",\"free\":\"" free "\",\"mount\":\"" ENVIRON["CM"] "\",\"tmpfs\":\"" ENVIRON["CT"] "\",\"entries\":["
+            }
+            {
+                if (c++) print ","
+                print "{\"mount\":\"" $1 "\",\"tmpfs\":\"" $2 "\",\"free\":\"" $3 "\",\"path\":\"" esc($4) "\",\"name\":\"" esc($5) "\"}"
+            }
+            END { print "]}" }'
+    ;;
+    mkdir)
+        # 「浏览」弹窗里的新建文件夹：父目录 + 名称，校验后 mkdir -p。
+        # 名称禁 / 与 . ..（防越级）；父目录禁 .. 段（防拼出 /xx/../yy 绕过意图路径）。
+        # rpcd 调用方即 root，这里防的是误操作而非提权。
+        read -r input
+        d="$(jsonfilter -s "$input" -e '@.dir' 2>/dev/null)"
+        nm="$(jsonfilter -s "$input" -e '@.name' 2>/dev/null)"
+        case "$d" in
+            /*) ;;
+            *) echo '{"error":"invalid"}'; exit 0 ;;
+        esac
+        d="${d%/}"
+        [ -n "$d" ] || d="/"
+        case "$d" in
+            "/.."|*/../*|*/..) echo '{"error":"invalid"}'; exit 0 ;;
+        esac
+        case "$nm" in
+            ""|"."|".."|*/*) echo '{"error":"invalid"}'; exit 0 ;;
+        esac
+        if mkdir -p -- "$d/$nm" 2>/dev/null; then
+            # d="/" 时 "$d/$nm" 会拼出 //name 双斜杠（POSIX 容忍，但前端会带着一路走歪）
+            case "$d" in
+                "/") tgt="/$nm" ;;
+                *) tgt="$d/$nm" ;;
+            esac
+            printf '{"path":"%s"}\n' "$(printf '%s' "$tgt" | awk '{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); printf "%s", $0 }')"
+        else
+            echo '{"error":"failed"}'
+        fi
+    ;;
+    *)
+        echo '{}'
+    ;;
+esac
+exit 0

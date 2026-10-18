@@ -1,0 +1,36 @@
+config core 'core'
+	# dsh 与 Node 运行时的安装根目录(所有大文件都在其下)。
+	# 默认 /opt/openwrt-dsh;路由器 flash overlay 放不下(引擎预检 300MB),
+	# iStoreOS 用户建议改到数据盘,如 /mnt/nvme0n1-4/openwrt-dsh
+	option install_dir '/opt/openwrt-dsh'
+
+	# npm 源;dsh 与其依赖(含原生件平台包)都从这取。
+	# 留空 = 默认 npmmirror;要用官方源显式设为 https://registry.npmjs.org
+	option npm_registry 'https://registry.npmmirror.com'
+
+	# GitHub 自更新(LuCI「检查更新/立即更新」):仓库 owner/repo,可改指自己的 fork
+	option github_repo 'StormDAmon/openwrt-dsh'
+
+	# GitHub 加速代理(前缀形态,拼在 https://github.com/... 之前),留空直连。
+	# 例: https://ghfast.top → https://ghfast.top/https://github.com/...
+	# CN 网络直连 GitHub 常不通;代理服务经常失效,所以不写死默认值,自行填可用的
+	option github_proxy ''
+
+config web 'web'
+	# dsh Web 服务(LuCI「Web 界面」区,procd 服务 openwrt-dsh-web):把路由器当
+	# dsh Web 主机,局域网设备浏览器直接打开 dsh 界面。
+	# 默认关(0):开启后 dsh 监听所有网卡,任何局域网设备拿到带令牌的链接都能通过
+	# AI 在本机执行操作——只在可信局域网开,且绝不把该端口转发/映射到外网。
+	# OpenWrt 默认防火墙拒绝 WAN 侧入站,不加转发规则时天然只有局域网可达。
+	option enabled '0'
+
+	# 监听端口:缺省(无此选项) = 自动选择——每次启动在 3081-3099 里取第一个空闲
+	# (2026-10-20 真机实锤 §25:dsh 生态/宿主控制台同吃 3080,固定端口必撞车,故
+	# 旧版的固定 3080 也并入自动)。显式指定(1-65535)则固定使用,被占会在启用时
+	# 被拒(port_busy)。改动保存后服务自动重启生效
+
+	# 局域网设置解锁补丁已默认涂抹（2026-10-21 拍板撤销开关，§26 补记）：引擎在
+	# 安装/更新/校验修复时无条件给 dsh 的 web 客户端涂单点补丁，放行局域网页面
+	# 读写设置（含 API 密钥）——只在可信局域网开服务，且绝不把端口转发/映射到外网。
+	# 原 UCI 选项 remote_settings 已废（残留值被忽略）；实况看 status 的
+	# web_remote_state，锚点失效时重跑「校验修复已装 dsh」即可

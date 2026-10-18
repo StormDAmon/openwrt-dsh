@@ -1,0 +1,133 @@
+#!/bin/sh
+# openwrt-dsh CLI（SSH 终端用；LuCI 是主入口，这里覆盖无浏览器的场景）
+# 子命令：status | install [dsh版本] | update [dsh版本] | doctor | uninstall [--purge]
+#         | migrate <目标目录> | check-update | selfupdate | log [字节数] | node | dsh [args…]
+
+MODDIR="/usr/lib/openwrt-dsh"
+. "$MODDIR/lib.sh"
+
+usage() {
+    cat <<'EOF'
+openwrt-dsh —— 在 OpenWrt/iStoreOS 上安装与更新 dsh(DeepSeek Harness)
+
+用法:
+  openwrt-dsh status            查看环境/运行时/dsh/软件包/任务状态
+  openwrt-dsh install [版本]    安装 dsh(默认最新版;后台执行,进度看 log)
+  openwrt-dsh update  [版本]    更新 dsh(同 install 链路,覆盖安装)
+  openwrt-dsh doctor            校验修复已装 dsh(原生件顶替/实载校验/标记重建,不改版本;
+                                官方 npm i -g 装完跑一次这个,补齐 musl 机的装后病根)
+  openwrt-dsh uninstall [--purge]
+                                卸载 dsh(默认保留托管 Node 运行时,重装免下载;
+                                --purge 连运行时一起删,释放全部空间)
+  openwrt-dsh migrate <目录>    把已装的 dsh 与托管运行时整体搬到目标目录(数据盘扩容;
+                                后台执行,进度看 log;完成后 UCI install_dir 自动切换)
+  openwrt-dsh check-update      去 GitHub Releases 查本插件的新版本(只读,秒级,不动系统)
+  openwrt-dsh selfupdate        立即更新本插件:下载 GitHub Release 的 ipk → sha256 校验
+                                → opkg 安装(后台执行,进度看 log)
+  openwrt-dsh log [字节数]      看任务日志尾部(默认 16KB)
+  openwrt-dsh node              打印托管 node 路径与版本
+  openwrt-dsh dsh [args…]       用托管运行时执行 dsh(等价装好后的 /usr/bin/dsh)
+
+安装目录/镜像/GitHub 加速代理等设置: uci show openwrt-dsh(配置项见 docs/architecture.md)
+EOF
+}
+
+case "$1" in
+    status)
+        sh "$MODDIR/status.sh"
+    ;;
+    install|update|doctor)
+        action="$1"
+        shift
+        sh "$MODDIR/task.sh" "$action" "$@"
+        rc=$?
+        echo "---- 任务日志(尾部) ----"
+        odw_log_tail 8192
+        exit "$rc"
+    ;;
+    uninstall)
+        shift
+        mode="keep"
+        [ "${1:-}" = "--purge" ] && mode="purge"
+        sh "$MODDIR/task.sh" uninstall "$mode"
+        rc=$?
+        echo "---- 任务日志(尾部) ----"
+        odw_log_tail 8192
+        exit "$rc"
+    ;;
+    migrate)
+        # 与 LuCI「迁移」按钮同一链路:目标目录校验与护栏在 task.sh/migrate-dsh.sh
+        if [ -z "${2:-}" ]; then
+            echo "用法: openwrt-dsh migrate <目标目录>" >&2
+            exit 64
+        fi
+        sh "$MODDIR/task.sh" migrate "$2"
+        rc=$?
+        echo "---- 任务日志(尾部) ----"
+        odw_log_tail 8192
+        exit "$rc"
+    ;;
+    check-update)
+        # 同步检查(联网,秒级);结果同时落缓存,LuCI 状态区会跟着显示
+        out="$(odw_update_check)"
+        g() { printf '%s\n' "$out" | sed -n "s/^$1=//p" | head -n 1; }
+        if [ "$(g status)" != "ok" ]; then
+            echo "✗ $(g error)"
+            exit 1
+        fi
+        case "$(g available)" in
+            yes) echo "发现新版本:$(g latest)(当前 $(g installed));执行 openwrt-dsh selfupdate 安装" ;;
+            no)  echo "已是最新:$(g latest)" ;;
+            *)   echo "最新发布:$(g latest);本机包版本未知(版本标记与 opkg 均无记录),可执行 openwrt-dsh selfupdate 转为托管" ;;
+        esac
+        ;;
+    selfupdate)
+        shift
+        sh "$MODDIR/task.sh" selfupdate
+        rc=$?
+        echo "---- 任务日志(尾部) ----"
+        odw_log_tail 8192
+        exit "$rc"
+    ;;
+    log)
+        odw_log_tail "${2:-16384}"
+    ;;
+    node)
+        d="$(odw_runtime_dir)"
+        newest=""
+        for f in "$d"/node-v*/bin/node; do
+            [ -x "$f" ] && newest="$f"
+        done
+        if [ -n "$newest" ]; then
+            echo "$newest ($("$newest" -v 2>/dev/null))"
+        else
+            echo "尚无托管 Node 运行时(先执行 openwrt-dsh install)"
+        fi
+    ;;
+    dsh)
+        shift
+        d="$(odw_runtime_dir)"
+        newest=""
+        for f in "$d"/node-v*/bin/dsh; do
+            [ -e "$f" ] && newest="$f"
+        done
+        if [ -n "$newest" ]; then
+            # bin/dsh 是 #!/usr/bin/env node 的 npm 产物,裸 shell 里 PATH 没有运行时目录必死
+            #(与 /usr/bin/dsh wrapper 同理),先把运行时 bin 喂进 PATH 再 exec
+            b="${newest%/*}"
+            case ":$PATH:" in *":$b:"*) : ;; *) PATH="$b:$PATH"; export PATH ;; esac
+            exec "$newest" "$@"
+        else
+            echo "dsh 尚未安装(先执行 openwrt-dsh install)" >&2
+            exit 1
+        fi
+    ;;
+    -h|--help|help)
+        usage
+        exit 0
+    ;;
+    *)
+        usage
+        exit 64
+    ;;
+esac
