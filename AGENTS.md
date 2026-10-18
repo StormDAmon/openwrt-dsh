@@ -18,7 +18,8 @@ uninstall 环境毒化 §4 再犯）。2026-10-19 起 e2e 补浏览器真实链�
 验证**（roadmap P0 是接力起点）。
 
 全功能容器回归跑法（约 2 分钟/容器；基座与假升级包都从**当前树**现打、全走 `work/`，
-**dist/ 全程零污染**——release.sh 会把 dist/*.ipk 全量挂上真发布；wsl 原生 docker 需要
+**dist/ 全程零污染**——release.sh 只挂本次版本的精确文件名 `openwrt-dsh_<VER>-r1_all.ipk`，
+dist 里的历史包不进发布，见 porting-notes §27；wsl 原生 docker 需要
 `--add-host=host.docker.internal:host-gateway`，编排脚本已带）：
 
 ```sh
@@ -157,6 +158,10 @@ buildroot 加的（Makefile 里 PKG_RELEASE 只写数字）。
 发布脚本未装/未登录 `gh` 时走兜底路径（自动开预填发布页，人工点 Publish）；
 装有并登录 `gh` 的机器上全自动（release 连附件一起传）。gh 访问 api.github.com
 常需代理，release.sh 会自动探测环境代理。
+**commit message 纪律**：多行 message 一律先写文件再 `git commit -F <file>`，
+禁止在命令替换里嵌 heredoc（`-m "$(cat <<'EOF' …)"`）——经单行 shell 层会被
+压扁整段进 subject，再被发布说明原样搬上公开页（porting-notes §28，
+2026-10-21 v0.1.0 实测事故）。
 
 验证矩阵与测试环境坑见 porting-notes §11。真机验收前不要宣称「已完成」。
 

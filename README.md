@@ -1,5 +1,7 @@
 # openwrt-dsh
 
+简体中文 | [English](README_en.md)
+
 在 **OpenWrt / iStoreOS**（x86_64 musl）上安装与运行 **dsh**（DeepSeek Harness，npm 包 `@deepseek-ai/dsh`）的软件包：一个 ipk 同时包含引擎（SSH CLI + rpcd 后端）与 LuCI 页面，装好后可在路由器管理页里一键安装/更新/卸载/迁移 dsh。
 
 dsh 及其依赖是为常规 Linux（glibc、systemd、bash）设计的；路由器是 musl libc、busybox ash、无 systemd、overlay 分区小、还常常没有编译工具。本项目的全部价值就在于把这条链路打通——每一个坑的成因与修法都实测过，见 [docs/porting-notes.md](docs/porting-notes.md)。

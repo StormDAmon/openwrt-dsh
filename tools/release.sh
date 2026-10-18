@@ -145,6 +145,26 @@ fi
 OUTDIR=dist
 NOTES="$OUTDIR/RELEASE-NOTES-$TAG.md"
 PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+# 发布说明预检:说明按 %s 原样搬运 subject,subject 里的命令残渣会原样上公开页
+# (2026-10-21 v0.1.0 实测:压扁的 heredoc commit 命令直达 Release,§28)。
+# 多行 message 必须用 git commit -F 文件创建(§28);这里拦二次事故,宁挂不静默。
+# dry-run 下 tag 尚未打(第 4 步被 run() 跳过),预览以 HEAD 为准,与将要打的 tag 一致。
+NOTES_REF="$TAG"
+if [ "$DRYRUN" -eq 1 ]; then
+    NOTES_REF=HEAD
+fi
+NOTES_RANGE="$NOTES_REF"
+if [ -n "$PREV" ]; then
+    NOTES_RANGE="$PREV..$NOTES_REF"
+fi
+echo "   变更预览($NOTES_RANGE,将原样进发布说明):"
+git log --format='   - %s' "$NOTES_RANGE"
+if git log --format='%h %s' "$NOTES_RANGE" | grep -nE "\$\(|<<'?EOF'?|git commit -m" >/dev/null; then
+    echo "✗ 变更区间内的 subject 含命令行残渣,会原样进公开发布说明。"
+    echo "  先改写 message(git commit --amend;多行 message 用 -F 文件传入,§28),再重新发布。"
+    git log --format='  %h %s' "$NOTES_RANGE" | grep -E "\$\(|<<'?EOF'?|git commit -m" || true
+    exit 1
+fi
 gen_notes() {
     {
         echo "# openwrt-dsh $TAG"
@@ -210,17 +230,23 @@ else
 fi
 
 if [ "$GH_OK" -eq 1 ]; then
-    # sha256 覆盖发布物(当前 = ipk);放这生成,构建产物一到位就能算
+    # 附件只挂本次构建的那一个 ipk:dist/ 里常年堆着开发期 dev-bump 出的几十个
+    # 历史 ipk(r3…r26…),旧版按 dist/*.ipk 全量 glob 组附件列表,真发布时把历史包
+    # 全传上了 GitHub Release(2026-10-21 实测坑,详见 porting-notes §27)。
+    # 产物名可精确预测:发布构建被第 3 步钉死 PKG_RELEASE=1(自增只属于开发期,§19),
+    # ipk 版本串里的 -rN 由 buildroot 按 PKG_RELEASE 拼出。
+    REL_IPK="$OUTDIR/openwrt-dsh_${VER}-r1_all.ipk"
+    ATT="$OUTDIR/sha256sums.txt $REL_IPK"
     if [ "$DRYRUN" -eq 1 ]; then
-        echo "   [dry-run] 写 $OUTDIR/sha256sums.txt(覆盖 dist 内全部交付物)"
+        echo "   [dry-run] 写 $OUTDIR/sha256sums.txt(只覆盖本次发布物)"
+        echo "   [dry-run] 附件:$ATT"
     else
-        ( cd "$OUTDIR" && sha256sum openwrt-dsh_*.ipk > sha256sums.txt )
+        # 防呆:发布物必须精确存在——第 5 步构建失败/产物命名变更时宁挂不静默,
+        # 严禁退回「拿 dist 里的旧包凑数」或空附件发布
+        [ -f "$REL_IPK" ] || { echo "✗ 未找到本次发布物 $REL_IPK(第 5 步应产出它,命名若变需同步改这里)"; exit 1; }
+        # sha256 只覆盖发布物;放这生成,构建产物一到位就能算
+        ( cd "$OUTDIR" && sha256sum "openwrt-dsh_${VER}-r1_all.ipk" > sha256sums.txt )
     fi
-    ATT=""
-    [ -f "$OUTDIR/sha256sums.txt" ] && ATT="$ATT $OUTDIR/sha256sums.txt"
-    for ipk in "$OUTDIR"/*.ipk; do
-        [ -f "$ipk" ] && ATT="$ATT $ipk"
-    done
     if [ "$DRAFT" -eq 1 ]; then
         run gh release create "$TAG" --draft --title "openwrt-dsh $TAG" --notes-file "$NOTES" $ATT
     else
@@ -236,7 +262,8 @@ else
     else
         echo "   已推送到远端;最后一步需你确认:"
         echo "   1. 发布页(已预填 tag 与标题): $URL"
-        echo "   2. 说明从 $NOTES 粘贴,附件拖入 $OUTDIR 下的 ipk 与 sha256sums.txt"
+        echo "   2. 说明从 $NOTES 粘贴;附件只拖这两个:openwrt-dsh_${VER}-r1_all.ipk"
+        echo "      与 sha256sums.txt(dist 里其余 ipk 是开发期历史包,不要传上 Release)"
         echo "   3. 点 Publish release,完成"
         if [ "$OPEN" -eq 1 ]; then
             open_url "$URL"

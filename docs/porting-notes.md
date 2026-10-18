@@ -901,6 +901,57 @@ ui-regression 补负向断言钉死「开关不得复活」。
    SSH 即时救援（不等新包）：`sh /usr/lib/openwrt-dsh/web-patch.sh apply &&
    /etc/init.d/openwrt-dsh-web restart`。
 
+## 27. 真发布把 dist/ 历史包全传上了 Release：发布清单必须精确点名（2026-10-21 实测）
+
+用户报：发布流程跑完，GitHub Release 上冒出二十来个 ipk，而本次版本只有一个。
+机制与修复：
+
+1. **dist/ 天然是历史包堆积地**：开发期每次「打包.bat」→ dev-bump.sh 把
+   PKG_RELEASE +1 → build-ipk.sh 产出一个新 ipk 落 dist/，旧的从不清理（号只增
+   不减、失败也不回收，见 §19——所以 r1…r26 中间还有跳号）。到发布时 dist/ 已
+   堆了 23 个 0.1.0-r* 包。
+2. **旧版 release.sh 的 gh 路径按 `dist/*.ipk` 全量 glob 组附件列表**，sha256sums
+   .txt 也是全量算法——`gh release create` 遂把 23 个历史包连同校验和一起传上
+   Release。AGENTS.md 里「dist/ 全程零污染」的旧警告正是冲着这个行为写的（当时
+   只是给 e2e 的纪律），发布脚本自己没有防呆。
+3. **修复**：发布物只认精确文件名 `openwrt-dsh_${VER}-r1_all.ipk`，附件 =
+   它 + sha256sums.txt 两个。为什么文件名可精确预测：发布构建在第 3 步被钉死
+   PKG_RELEASE=1（§19：自增只属于开发期），而 ipk 版本串里的 `-rN` 由 buildroot
+   按 PKG_RELEASE 拼（AGENTS.md 版本管理约定），故恒为 `openwrt-dsh_<VER>-r1
+   _all.ipk`。sha256sums 同步只覆盖这一个文件；非 dry-run 下发布物不存在就报错
+   退出——宁挂不静默（防产物命名变更后拿旧包/空列表发布）。dry-run 不做存在性
+   断言（dry-run 本就不构建，只打印将挂的附件）。
+4. **教训**：「开发期产物目录」和「发布物清单」必须是两个集合。凡把目录 glob
+   直接当发布清单的脚本，目录里堆了什么就发布什么；发布类脚本要点名具体文件并
+   做存在性断言才算防呆。兜底（无 gh）路径的提示文案同步只列这两个附件，防止
+   人工拖拽时把 dist/ 一股脑拖上去。
+
+## 28. 发布说明曝光了一整行压扁的 commit 命令：多行 message 用 -F，发布前预检 subject（2026-10-21 实测）
+
+v0.1.0 发布当天，Release 页「变更」第一条是一条十几行的「命令」——从
+`git add` 一直到 `EOF )"` 原样公开（截图级社死）。链条与修复：
+
+1. **根因在 message 的创建方式，不在 release.sh**：给 §27 修复提交写 message
+   时用了 `git commit -m "$(cat <<'EOF' …)"` 形态，经单行 shell 层传输
+   （PowerShell `-Command`/编码管道）后换行全部丢失，heredoc 不再生效，整段
+   命令文本——连 `git add` 前缀带进去——原样成了 subject。
+2. **发布说明是 subject 的放大器**：release.sh 按 `git log --format='- %s'`
+   把 subject 原样搬进 RELEASE-NOTES，`gh release create --notes-file` 直上
+   公开页。垃圾进什么就放大什么，中间没有任何人眼检查。
+3. **修复（三道）**：
+   - 该提交 amend 重写 message，连同 tag v0.1.0 一起 force-push（发布刚一小时
+     无消费者，Source code 归档随新 tag 重生成、哈希变化可接受；ipk/sha256sums
+     附件不受影响——修复只动 docs/tools，不进包）；
+   - release.sh 第 6 步发布前**预检变更区间 subject**：出现 `$(`、`<<'EOF'`、
+     `git commit -m` 等命令残渣即报错退出，宁挂不静默（与 §27 的存在性断言同
+     哲学），同时打印变更预览供人眼过一遍；
+   - AGENTS.md 写回纪律：**多行 commit message 一律先写文件再
+     `git commit -F <file>`**，禁止在命令替换里嵌 heredoc——它活不过任何
+     单行 shell 层。
+4. **教训**：凡面向公开页的内容（Release 说明、changelog）由仓库元数据自动
+   生成，「自动生成」不是免检通道——生成前必须预览一遍原料；而原料的质量
+   靠创建时就用不会压扁的方式（-F 文件）来保证，事后补救要动历史。
+
 
 
 
